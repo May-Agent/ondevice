@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = ["coreml"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/May-Agent/ondevice"
+
+[workspace.dependencies]
+thiserror = { version = "2.0.21", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+
+[package]
+name = "ondevice"
+version = "0.0.1"
+description = "Pinned, verified first-use downloads of on-device model files"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["fetch", "archive", "zenwave"]
+# The store: download a pin through a `Transport` into a cache, verify it,
+# install it.
+fetch = [
+    "dep:async-fs",
+    "dep:async-io",
+    "dep:blocking",
+    "dep:futures-lite",
+    "dep:sha2",
+    "dep:tempfile",
+    "dep:thiserror",
+    "dep:tracing",
+]
+# `Archive` pins: tar archives compressed with zstd, unpacked into a directory.
+archive = ["fetch", "dep:tar", "dep:zstd"]
+# The `Zenwave` transport.
+zenwave = ["fetch", "dep:zenwave"]
+
+[dependencies]
+async-fs = { version = "2.2.0", default-features = false, optional = true }
+async-io = { version = "2.6.0", default-features = false, optional = true }
+blocking = { version = "1.7.0", default-features = false, optional = true }
+const-hex = { version = "1.19.3", default-features = false }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"], optional = true }
+sha2 = { version = "0.11.1", default-features = false, optional = true }
+tar = { version = "0.4.46", default-features = false, optional = true }
+tempfile = { version = "3.27.0", default-features = false, optional = true }
+thiserror = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+zenwave = { version = "0.8.0", default-features = false, features = ["hyper-backend", "rustls"], optional = true }
+zstd = { version = "0.14.3", default-features = false, optional = true }
+
+[dev-dependencies]
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+tar = { version = "0.4.46", default-features = false }
+tempfile = { version = "3.27.0", default-features = false }
+zenwave = { version = "0.8.0", default-features = false, features = ["hyper-backend", "rustls"] }
+zstd = { version = "0.14.3", default-features = false }
+
+[[test]]
+name = "store"
+required-features = ["archive", "zenwave"]

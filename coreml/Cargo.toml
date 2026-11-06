@@ -1,0 +1,37 @@
+[package]
+name = "ondevice-coreml"
+version = "0.0.1"
+description = "Bucketed Core ML inference over one compiled multifunction model"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["headroom"]
+# Whether the host has headroom for GPU inference — mains power and a SoC
+# below serious thermal pressure — and a monitor reporting its changes.
+headroom = [
+    "dep:objc2-core-foundation",
+    "dep:objc2-io-kit",
+    "objc2-foundation/NSNotification",
+    "objc2-foundation/NSOperation",
+    "objc2-foundation/NSProcessInfo",
+]
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+block2 = { version = "0.6.2", default-features = false }
+half = { version = "2.7.1", default-features = false }
+objc2 = { version = "0.6.5", default-features = false }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["block2", "CFRunLoop", "CFString"], optional = true }
+objc2-core-ml = { version = "0.3.2", default-features = false, features = ["MLArrayBatchProvider", "MLBatchProvider", "MLDictionaryFeatureProvider", "MLFeatureProvider", "MLFeatureValue", "MLModel", "MLModelConfiguration", "MLMultiArray", "block2"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "block2"] }
+objc2-io-kit = { version = "0.3.2", default-features = false, features = ["ps"], optional = true }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[[test]]
+name = "headroom"
+required-features = ["headroom"]

@@ -1,0 +1,82 @@
+name: release-plz
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    name: Update release PR against dev
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - name: Run release-plz release-pr
+        id: release-plz
+        uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A PR pushed with GITHUB_TOKEN triggers no pull_request workflows, so
+      # the checks run through workflow_dispatch on the PR's head; auto-merge
+      # lands it once they are green.
+      - name: Run CI on the release PR and enable auto-merge
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          PR: ${{ steps.release-plz.outputs.pr }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          number=$(jq -er '.number' <<<"$PR")
+          head=$(jq -er '.head_branch' <<<"$PR")
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$head"
+          gh workflow run linux.yml --repo "$GITHUB_REPOSITORY" --ref "$head"
+          gh workflow run windows.yml --repo "$GITHUB_REPOSITORY" --ref "$head"
+          gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --auto --merge
+
+  release:
+    name: Tag releases
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - name: Run release-plz release
+        uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
