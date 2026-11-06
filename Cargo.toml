@@ -14,7 +14,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [package]
 name = "ondevice"
-version = "0.0.1"
+version = "0.0.2"
 description = "Pinned, verified first-use downloads of on-device model files"
 edition.workspace = true
 rust-version.workspace = true
