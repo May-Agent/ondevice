@@ -311,3 +311,62 @@ fn a_file_mismatch_is_rejected_and_leaves_nothing() {
     assert_no_leftovers(store.root());
     server.join().unwrap();
 }
+
+#[test]
+fn read_only_archive_files_install_with_their_permissions() {
+    let body = support::http::archive_modes(&[("weights.bin", b"weights", 0o444)]);
+    let (url, server) = serve_once("200 OK", Some(body.len() as u64), body.clone());
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path(), Zenwave);
+    let pin = pin(&url, &body, Archive);
+    let directory = block_on(store.ensure(&pin, |_| {})).unwrap();
+    let weights = directory.join("weights.bin");
+    assert_eq!(std::fs::read(&weights).unwrap(), b"weights");
+    assert!(
+        std::fs::metadata(&weights)
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
+    assert_no_leftovers(store.root());
+    server.join().unwrap();
+}
+
+#[test]
+fn failed_extraction_removes_preceding_read_only_files() {
+    let body = support::http::archive_modes(&[
+        ("weights.bin", b"weights", 0o444),
+        ("weights.bin/invalid", b"cannot be inside a file", 0o644),
+    ]);
+    let (url, server) = serve_once("200 OK", Some(body.len() as u64), body.clone());
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path(), Zenwave);
+    let pin = pin(&url, &body, Archive);
+    assert!(block_on(store.ensure(&pin, |_| {})).is_err());
+    assert!(!store.path(&pin).exists());
+    assert_no_leftovers(store.root());
+    server.join().unwrap();
+}
+
+#[test]
+fn escaping_paths_are_rejected_on_every_host() {
+    for path in [
+        b"../outside".as_slice(),
+        b"..\\outside",
+        b"C:\\outside",
+        b"/outside",
+    ] {
+        let body = support::http::raw_path_archive(path);
+        let (url, server) = serve_once("200 OK", Some(body.len() as u64), body.clone());
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path(), Zenwave);
+        let pin = pin(&url, &body, Archive);
+        assert!(matches!(
+            block_on(store.ensure(&pin, |_| {})),
+            Err(Error::Archive { .. })
+        ));
+        assert!(!store.path(&pin).exists());
+        assert_no_leftovers(store.root());
+        server.join().unwrap();
+    }
+}
