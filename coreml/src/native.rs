@@ -2,7 +2,11 @@
 use crate::model::core_ml;
 use crate::{DataType, Element, Error, TensorData};
 use block2::StackBlock;
-use objc2::{AllocAnyThread, rc::Retained, runtime::AnyObject};
+use objc2::{
+    AllocAnyThread,
+    rc::{Retained, autoreleasepool},
+    runtime::AnyObject,
+};
 use objc2_core_ml::{
     MLDictionaryFeatureProvider, MLFeatureValue, MLMultiArray, MLMultiArrayDataType,
 };
@@ -29,49 +33,51 @@ impl<T: Element> Clone for Tensor<T> {
 impl<T: Element> Tensor<T> {
     /// Copy row-major values into a new native tensor of an explicit shape.
     pub fn from_slice(shape: &[usize], values: &[T]) -> Result<Self, Error> {
-        let count = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d));
-        if shape.is_empty() || shape.contains(&0) || count != Some(values.len()) {
-            return Err(Error::TensorShape {
-                shape: shape.to_vec(),
-                elements: values.len(),
-            });
-        }
-        let dims = NSArray::from_retained_slice(
-            &shape
-                .iter()
-                .map(|&d| NSNumber::new_usize(d))
-                .collect::<Vec<_>>(),
-        );
-        // SAFETY: dimensions are nonzero and their product matches the values.
-        let array = unsafe {
-            MLMultiArray::initWithShape_dataType_error(
-                MLMultiArray::alloc(),
-                &dims,
-                ml_type(T::DATA_TYPE),
-            )
-        }
-        .map_err(core_ml)?;
-        let fill = StackBlock::new(
-            |ptr: NonNull<c_void>, _: NSInteger, strides: NonNull<NSArray<NSNumber>>| {
-                // SAFETY: Core ML lends these strides for this writable buffer;
-                // requesting mutable access can replace the backing storage.
-                let strides: Vec<usize> = unsafe { strides.as_ref() }
+        autoreleasepool(|_| {
+            let count = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d));
+            if shape.is_empty() || shape.contains(&0) || count != Some(values.len()) {
+                return Err(Error::TensorShape {
+                    shape: shape.to_vec(),
+                    elements: values.len(),
+                });
+            }
+            let dims = NSArray::from_retained_slice(
+                &shape
                     .iter()
-                    .map(|n| n.as_usize())
-                    .collect();
-                let base = ptr.as_ptr().cast::<T>();
-                for (offset, &value) in offsets(shape, &strides).zip(values) {
-                    // SAFETY: offsets follow the shape and current buffer strides.
-                    unsafe { base.add(offset).write(value) };
-                }
-            },
-        );
-        // SAFETY: the handler writes only valid elements and retains no pointer.
-        unsafe { array.getMutableBytesWithHandler(&fill) };
-        Ok(Self {
-            array,
-            shape: shape.into(),
-            element: PhantomData,
+                    .map(|&d| NSNumber::new_usize(d))
+                    .collect::<Vec<_>>(),
+            );
+            // SAFETY: dimensions are nonzero and their product matches the values.
+            let array = unsafe {
+                MLMultiArray::initWithShape_dataType_error(
+                    MLMultiArray::alloc(),
+                    &dims,
+                    ml_type(T::DATA_TYPE),
+                )
+            }
+            .map_err(core_ml)?;
+            let fill = StackBlock::new(
+                |ptr: NonNull<c_void>, _: NSInteger, strides: NonNull<NSArray<NSNumber>>| {
+                    // SAFETY: Core ML lends these strides for this writable buffer;
+                    // requesting mutable access can replace the backing storage.
+                    let strides: Vec<usize> = unsafe { strides.as_ref() }
+                        .iter()
+                        .map(|n| n.as_usize())
+                        .collect();
+                    let base = ptr.as_ptr().cast::<T>();
+                    for (offset, &value) in offsets(shape, &strides).zip(values) {
+                        // SAFETY: offsets follow the shape and current buffer strides.
+                        unsafe { base.add(offset).write(value) };
+                    }
+                },
+            );
+            // SAFETY: the handler writes only valid elements and retains no pointer.
+            unsafe { array.getMutableBytesWithHandler(&fill) };
+            Ok(Self {
+                array,
+                shape: shape.into(),
+                element: PhantomData,
+            })
         })
     }
     pub(crate) fn from_array(array: Retained<MLMultiArray>, name: &str) -> Result<Self, Error> {
@@ -101,21 +107,23 @@ impl<T: Element> Tensor<T> {
     }
     /// Explicitly read the tensor into row-major host storage, respecting strides.
     pub fn read(&self) -> TensorData<T> {
-        // SAFETY: the array stays retained through the synchronous handler.
-        let strides: Vec<isize> = unsafe { self.array.strides() }
-            .iter()
-            .map(|n| n.as_isize())
-            .collect();
-        let bytes = RefCell::new(Vec::new());
-        let copy = StackBlock::new(|ptr: NonNull<c_void>, size: NSInteger| {
-            // SAFETY: Core ML lends exactly size bytes for this handler.
-            let data =
-                unsafe { std::slice::from_raw_parts(ptr.as_ptr().cast::<u8>(), size as usize) };
-            bytes.borrow_mut().extend_from_slice(data);
-        });
-        // SAFETY: copy reads the lent storage without retaining a pointer.
-        unsafe { self.array.getBytesWithHandler(&copy) };
-        TensorData::gather(&bytes.into_inner(), &self.shape, &strides)
+        autoreleasepool(|_| {
+            // SAFETY: the array stays retained through the synchronous handler.
+            let strides: Vec<isize> = unsafe { self.array.strides() }
+                .iter()
+                .map(|n| n.as_isize())
+                .collect();
+            let bytes = RefCell::new(Vec::new());
+            let copy = StackBlock::new(|ptr: NonNull<c_void>, size: NSInteger| {
+                // SAFETY: Core ML lends exactly size bytes for this handler.
+                let data =
+                    unsafe { std::slice::from_raw_parts(ptr.as_ptr().cast::<u8>(), size as usize) };
+                bytes.borrow_mut().extend_from_slice(data);
+            });
+            // SAFETY: copy reads the lent storage without retaining a pointer.
+            unsafe { self.array.getBytesWithHandler(&copy) };
+            TensorData::gather(&bytes.into_inner(), &self.shape, &strides)
+        })
     }
 }
 fn offsets<'a>(shape: &'a [usize], strides: &'a [usize]) -> impl Iterator<Item = usize> + 'a {
@@ -150,15 +158,17 @@ impl Inputs {
         name: impl Into<String>,
         tensor: &Tensor<T>,
     ) -> Result<(), Error> {
-        let name = name.into();
-        if self.values.contains_key(&name) {
-            return Err(Error::DuplicateInput(name));
-        }
-        // SAFETY: featureValue retains the live immutable array.
-        self.values.insert(name, unsafe {
-            MLFeatureValue::featureValueWithMultiArray(&tensor.array)
-        });
-        Ok(())
+        autoreleasepool(|_| {
+            let name = name.into();
+            if self.values.contains_key(&name) {
+                return Err(Error::DuplicateInput(name));
+            }
+            // SAFETY: featureValue retains the live immutable array.
+            self.values.insert(name, unsafe {
+                MLFeatureValue::featureValueWithMultiArray(&tensor.array)
+            });
+            Ok(())
+        })
     }
     pub(crate) fn provider(&self) -> Result<Retained<MLDictionaryFeatureProvider>, Error> {
         let keys: Vec<_> = self.values.keys().map(|k| NSString::from_str(k)).collect();

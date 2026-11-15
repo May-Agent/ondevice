@@ -3,7 +3,7 @@ use crate::model::{configuration, core_ml};
 use crate::{ComputeUnits, Error, Model};
 use block2::RcBlock;
 use objc2::{
-    rc::Retained,
+    rc::{Retained, autoreleasepool},
     runtime::{AnyObject, ProtocolObject},
 };
 use objc2_core_ml::{
@@ -41,46 +41,52 @@ impl Model {
         function: Option<&str>,
         units: ComputeUnits,
     ) -> Result<ComputePlan, Error> {
-        let url = NSURL::fileURLWithPath_isDirectory(
-            &NSString::from_str(&self.path().to_string_lossy()),
-            true,
-        );
-        let config = configuration(function, units);
         let (send, receive) = async_channel::bounded(1);
-        let callback = RcBlock::new(move |plan: *mut MLComputePlan, error: *mut NSError| {
-            // SAFETY: callback pointers are either nil or live borrowed objects;
-            // retaining before returning transfers their lifetime to the receiver.
-            let result = unsafe {
-                match (Retained::retain(plan), Retained::retain(error)) {
-                    (Some(plan), _) => Ok(PlanHandle(plan)),
-                    (_, Some(error)) => Err(core_ml(error)),
-                    _ => Err(Error::MissingCallbackResult),
-                }
+        autoreleasepool(|_| {
+            let url = NSURL::fileURLWithPath_isDirectory(
+                &NSString::from_str(&self.path().to_string_lossy()),
+                true,
+            );
+            let config = configuration(function, units);
+            let callback = RcBlock::new(move |plan: *mut MLComputePlan, error: *mut NSError| {
+                autoreleasepool(|_| {
+                    // SAFETY: callback pointers are either nil or live borrowed objects;
+                    // retaining before returning transfers their lifetime to the receiver.
+                    let result = unsafe {
+                        match (Retained::retain(plan), Retained::retain(error)) {
+                            (Some(plan), _) => Ok(PlanHandle(plan)),
+                            (_, Some(error)) => Err(core_ml(error)),
+                            _ => Err(Error::MissingCallbackResult),
+                        }
+                    };
+                    let _ = send.try_send(result);
+                });
+            });
+            // SAFETY: Core ML retains the completion block and its arguments for the
+            // operation; the callback does not borrow this stack frame.
+            unsafe {
+                MLComputePlan::loadContentsOfURL_configuration_completionHandler(
+                    &url, &config, &callback,
+                )
             };
-            let _ = send.try_send(result);
         });
-        // SAFETY: Core ML retains the completion block and its arguments for the
-        // operation; the callback does not borrow this stack frame.
-        unsafe {
-            MLComputePlan::loadContentsOfURL_configuration_completionHandler(
-                &url, &config, &callback,
-            )
-        };
         let plan = receive
             .recv()
             .await
             .map_err(|_| Error::MissingCallbackResult)??;
-        let mut operations = Vec::new();
-        // SAFETY: the retained plan owns its model structure.
-        structure(
-            &plan.0,
-            &*unsafe { plan.0.modelStructure() },
-            &[],
-            &mut operations,
-        )?;
-        Ok(ComputePlan {
-            requested_units: units,
-            operations,
+        autoreleasepool(|_| {
+            let mut operations = Vec::new();
+            // SAFETY: the retained plan owns its model structure.
+            structure(
+                &plan.0,
+                &*unsafe { plan.0.modelStructure() },
+                &[],
+                &mut operations,
+            )?;
+            Ok(ComputePlan {
+                requested_units: units,
+                operations,
+            })
         })
     }
 }
