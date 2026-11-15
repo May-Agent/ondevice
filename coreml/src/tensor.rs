@@ -126,12 +126,12 @@ impl<T: Element> Input for Sequence<'_, T> {}
 
 /// A model output, copied out of its multi-array in row-major order.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Tensor<T> {
+pub struct TensorData<T> {
     shape: Box<[usize]>,
     data: Vec<T>,
 }
 
-impl<T: Element> Tensor<T> {
+impl<T: Element> TensorData<T> {
     /// Gathers the elements of a multi-array of `shape` and `strides`
     /// (in elements) out of its raw storage `bytes`.
     ///
@@ -189,7 +189,7 @@ impl<T: Element> Tensor<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::Tensor;
+    use super::TensorData as Tensor;
 
     fn bytes(values: &[i32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_ne_bytes()).collect()

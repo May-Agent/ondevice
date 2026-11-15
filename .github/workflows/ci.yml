@@ -75,3 +75,14 @@ jobs:
         run: cargo hack clippy --locked --each-feature --all-targets --workspace -- -D warnings
       - name: test
         run: cargo test --locked --workspace
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: 0.9.16
+      - name: Generate Core ML contract models
+        run: uv run --directory coreml/fixtures --locked python generate.py
+      - name: Core ML contracts
+        env:
+          ONDEVICE_COREML_FIXTURES: ${{ github.workspace }}/coreml/fixtures/models
+          ONDEVICE_COREML_MODEL_DIR: ${{ github.workspace }}/coreml/fixtures/models/buckets
+        run: cargo test --locked -p ondevice-coreml --all-features --test runtime --test model -- --include-ignored

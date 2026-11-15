@@ -1,1 +1,4 @@
 /target/
+/coreml/fixtures/.venv/
+/coreml/fixtures/models/
+__pycache__/
