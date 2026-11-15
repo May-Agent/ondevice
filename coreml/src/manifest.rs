@@ -63,7 +63,7 @@ pub struct TensorSpec {
 
 /// One function of the multifunction model: a bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Function {
+pub struct Bucket {
     /// The Core ML function name, such as `len_128`.
     pub name: String,
     /// The sequence length the function accepts.
@@ -80,7 +80,7 @@ pub struct Function {
 #[derive(Debug, Clone)]
 pub struct Manifest {
     /// Ascending by `len`.
-    functions: Box<[Function]>,
+    functions: Box<[Bucket]>,
     inputs: BTreeMap<String, TensorSpec>,
     outputs: BTreeMap<String, TensorSpec>,
 }
@@ -113,10 +113,10 @@ impl Manifest {
 
     fn parse(bytes: &[u8]) -> Result<Self, Invalid> {
         let raw: RawManifest = serde_json::from_slice(bytes).map_err(Invalid::Json)?;
-        let mut functions: Vec<Function> = raw
+        let mut functions: Vec<Bucket> = raw
             .functions
             .into_iter()
-            .map(|(name, len)| Function { name, len })
+            .map(|(name, len)| Bucket { name, len })
             .collect();
         functions.sort_unstable_by_key(|function| function.len);
         if functions.is_empty() {
@@ -148,7 +148,7 @@ impl Manifest {
 
     /// The functions, ascending by length.
     #[must_use]
-    pub fn functions(&self) -> &[Function] {
+    pub fn functions(&self) -> &[Bucket] {
         &self.functions
     }
 
@@ -161,7 +161,7 @@ impl Manifest {
     /// The smallest function that holds `len`, or `None` past
     /// [`max_len`](Self::max_len).
     #[must_use]
-    pub fn function_for(&self, len: usize) -> Option<&Function> {
+    pub fn function_for(&self, len: usize) -> Option<&Bucket> {
         self.functions.iter().find(|function| len <= function.len)
     }
 
