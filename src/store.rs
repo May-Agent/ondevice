@@ -389,6 +389,10 @@ fn remove_staging(path: &Path) -> io::Result<()> {
             remove_staging(&entry.path())?;
         } else {
             #[cfg(windows)]
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows only: clear the DOS read-only attribute without changing ACLs"
+            )]
             if kind.is_file() {
                 let mut permissions = entry.metadata()?.permissions();
                 permissions.set_readonly(false);
