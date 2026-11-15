@@ -7,12 +7,21 @@ use std::thread;
 
 /// A tar.zst archive in memory with `entries` as `(path, contents)` files.
 pub fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    archive_modes(
+        &entries
+            .iter()
+            .map(|&(path, data)| (path, data, 0o644))
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub fn archive_modes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     let encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
     let mut builder = tar::Builder::new(encoder);
-    for (name, bytes) in entries {
+    for (name, bytes, mode) in entries {
         let mut header = tar::Header::new_gnu();
         header.set_size(bytes.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(*mode);
         header.set_cksum();
         builder.append_data(&mut header, name, *bytes).unwrap();
     }
@@ -64,4 +73,17 @@ pub fn serve_once(
         let _ = stream.write_all(&body);
     });
     (url, handle)
+}
+
+/// Construct a raw header to test paths the safe archive builder rejects.
+pub fn raw_path_archive(path: &[u8]) -> Vec<u8> {
+    let encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+    let mut builder = tar::Builder::new(encoder);
+    let mut header = tar::Header::new_gnu();
+    header.as_mut_bytes()[..path.len()].copy_from_slice(path);
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, std::io::empty()).unwrap();
+    builder.into_inner().unwrap().finish().unwrap()
 }
