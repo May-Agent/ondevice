@@ -61,6 +61,45 @@ fn heterogeneous_inputs_and_native_output_reuse() {
 
 #[test]
 #[ignore = "requires generated Core ML fixtures"]
+fn retained_output_outlives_model_and_input_providers() {
+    let output = {
+        let mut function = model("affine")
+            .function(None, ComputeUnits::CpuOnly)
+            .unwrap();
+        let matrix = Tensor::from_slice(&[2, 3], &[1f32, 2., 3., 4., 5., 6.]).unwrap();
+        let bias = Tensor::from_slice(&[3], &[10f32, 20., 30.]).unwrap();
+        let mut inputs = Inputs::new();
+        inputs.insert("matrix", &matrix).unwrap();
+        inputs.insert("bias", &bias).unwrap();
+        function
+            .predict(&inputs)
+            .unwrap()
+            .tensor::<f32>("output")
+            .unwrap()
+    };
+    assert_eq!(output.read().data(), [11., 22., 33., 14., 25., 36.]);
+    let mut consumer = model("affine")
+        .function(None, ComputeUnits::CpuOnly)
+        .unwrap();
+    let bias = Tensor::from_slice(&[3], &[1f32; 3]).unwrap();
+    let mut inputs = Inputs::new();
+    inputs.insert("matrix", &output).unwrap();
+    inputs.insert("bias", &bias).unwrap();
+    drop(output);
+    assert_eq!(
+        consumer
+            .predict(&inputs)
+            .unwrap()
+            .tensor::<f32>("output")
+            .unwrap()
+            .read()
+            .data(),
+        [12., 23., 34., 15., 26., 37.]
+    );
+}
+
+#[test]
+#[ignore = "requires generated Core ML fixtures"]
 fn states_accumulate_reset_and_remain_isolated() {
     let artifact = model("accumulate");
     let mut function = artifact.function(None, ComputeUnits::CpuOnly).unwrap();

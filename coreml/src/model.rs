@@ -1,6 +1,10 @@
 //! Compiled artifacts, independently loaded functions, and owned stateful sessions.
 use crate::{ComputeUnits, DataType, Element, Error, Inputs, Tensor};
-use objc2::{AllocAnyThread, rc::Retained, runtime::ProtocolObject};
+use objc2::{
+    AllocAnyThread,
+    rc::{Retained, autoreleasepool},
+    runtime::ProtocolObject,
+};
 use objc2_core_ml::{
     MLArrayBatchProvider, MLBatchProvider, MLFeatureDescription, MLFeatureProvider, MLModel,
     MLModelConfiguration, MLState,
@@ -46,27 +50,30 @@ impl Model {
     /// Load a named function, or the model's default when name is None.
     /// Loading and prediction execute on the caller's inference thread.
     pub fn function(&self, name: Option<&str>, units: ComputeUnits) -> Result<Function, Error> {
-        let config = configuration(name, units);
-        let url = NSURL::fileURLWithPath_isDirectory(
-            &NSString::from_str(&self.path.to_string_lossy()),
-            true,
-        );
-        // SAFETY: URL and configuration are live objects with valid values.
-        let native = unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &config) }
-            .map_err(core_ml)?;
-        // SAFETY: the model owns its feature description dictionaries.
-        let description = unsafe {
-            let d = native.modelDescription();
-            FunctionDescription {
-                inputs: describe(&d.inputDescriptionsByName(), false)?,
-                outputs: describe(&d.outputDescriptionsByName(), false)?,
-                states: describe(&d.stateDescriptionsByName(), true)?,
-            }
-        };
-        Ok(Function {
-            native,
-            description,
-            not_sync: PhantomData,
+        autoreleasepool(|_| {
+            let config = configuration(name, units);
+            let url = NSURL::fileURLWithPath_isDirectory(
+                &NSString::from_str(&self.path.to_string_lossy()),
+                true,
+            );
+            // SAFETY: URL and configuration are live objects with valid values.
+            let native =
+                unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &config) }
+                    .map_err(core_ml)?;
+            // SAFETY: the model owns its feature description dictionaries.
+            let description = unsafe {
+                let d = native.modelDescription();
+                FunctionDescription {
+                    inputs: describe(&d.inputDescriptionsByName(), false)?,
+                    outputs: describe(&d.outputDescriptionsByName(), false)?,
+                    states: describe(&d.stateDescriptionsByName(), true)?,
+                }
+            };
+            Ok(Function {
+                native,
+                description,
+                not_sync: PhantomData,
+            })
         })
     }
     pub fn path(&self) -> &Path {
@@ -88,64 +95,70 @@ impl Function {
         &self.description
     }
     pub fn predict(&mut self, inputs: &Inputs) -> Result<Prediction, Error> {
-        if !self.description.states.is_empty() {
-            return Err(Error::StateRequired);
-        }
-        let input = ProtocolObject::from_retained(inputs.provider()?);
-        // SAFETY: valid feature provider; &mut self serializes model use.
-        let features =
-            unsafe { self.native.predictionFromFeatures_error(&input) }.map_err(core_ml)?;
-        Ok(Prediction { features })
+        autoreleasepool(|_| {
+            if !self.description.states.is_empty() {
+                return Err(Error::StateRequired);
+            }
+            let input = ProtocolObject::from_retained(inputs.provider()?);
+            // SAFETY: valid feature provider; &mut self serializes model use.
+            let features =
+                unsafe { self.native.predictionFromFeatures_error(&input) }.map_err(core_ml)?;
+            Ok(Prediction { features })
+        })
     }
     pub fn predict_batch(&mut self, batch: &[Inputs]) -> Result<Vec<Prediction>, Error> {
-        if !self.description.states.is_empty() {
-            return Err(Error::StateRequired);
-        }
-        if batch.is_empty() {
-            return Ok(Vec::new());
-        }
-        let providers = batch
-            .iter()
-            .map(|x| x.provider().map(ProtocolObject::from_retained))
-            .collect::<Result<Vec<_>, _>>()?;
-        let array = NSArray::from_retained_slice(&providers);
-        // SAFETY: every array entry is a live feature provider.
-        let provider = unsafe {
-            MLArrayBatchProvider::initWithFeatureProviderArray(
-                MLArrayBatchProvider::alloc(),
-                &array,
-            )
-        };
-        // SAFETY: exclusive model access and a valid batch provider.
-        let out = unsafe {
-            self.native
-                .predictionsFromBatch_error(&ProtocolObject::from_retained(provider))
-        }
-        .map_err(core_ml)?;
-        // SAFETY: out is a retained Core ML batch provider.
-        let count = unsafe { out.count() } as usize;
-        if count != batch.len() {
-            return Err(Error::BatchCount {
-                expected: batch.len(),
-                actual: count,
-            });
-        }
-        Ok((0..count)
-            .map(|i| Prediction {
-                // SAFETY: i is within the returned batch count.
-                features: unsafe { out.featuresAtIndex(i as NSInteger) },
-            })
-            .collect())
+        autoreleasepool(|_| {
+            if !self.description.states.is_empty() {
+                return Err(Error::StateRequired);
+            }
+            if batch.is_empty() {
+                return Ok(Vec::new());
+            }
+            let providers = batch
+                .iter()
+                .map(|x| x.provider().map(ProtocolObject::from_retained))
+                .collect::<Result<Vec<_>, _>>()?;
+            let array = NSArray::from_retained_slice(&providers);
+            // SAFETY: every array entry is a live feature provider.
+            let provider = unsafe {
+                MLArrayBatchProvider::initWithFeatureProviderArray(
+                    MLArrayBatchProvider::alloc(),
+                    &array,
+                )
+            };
+            // SAFETY: exclusive model access and a valid batch provider.
+            let out = unsafe {
+                self.native
+                    .predictionsFromBatch_error(&ProtocolObject::from_retained(provider))
+            }
+            .map_err(core_ml)?;
+            // SAFETY: out is a retained Core ML batch provider.
+            let count = unsafe { out.count() } as usize;
+            if count != batch.len() {
+                return Err(Error::BatchCount {
+                    expected: batch.len(),
+                    actual: count,
+                });
+            }
+            Ok((0..count)
+                .map(|i| Prediction {
+                    // SAFETY: i is within the returned batch count.
+                    features: unsafe { out.featuresAtIndex(i as NSInteger) },
+                })
+                .collect())
+        })
     }
     /// Transfer this function to a session that exclusively owns its state.
     /// Load another function from the artifact for an independent request.
     pub fn into_session(self) -> Session {
-        // SAFETY: newState creates zeroed state belonging to this exact model.
-        let state = unsafe { self.native.newState() };
-        Session {
-            function: self,
-            state,
-        }
+        autoreleasepool(|_| {
+            // SAFETY: newState creates zeroed state belonging to this exact model.
+            let state = unsafe { self.native.newState() };
+            Session {
+                function: self,
+                state,
+            }
+        })
     }
 }
 /// A function and its state, moved and reset together. State from another
@@ -162,20 +175,24 @@ impl Session {
         self.function.description()
     }
     pub fn reset(&mut self) {
-        // SAFETY: replacement state is created by its owning model.
-        self.state = unsafe { self.function.native.newState() };
+        autoreleasepool(|_| {
+            // SAFETY: replacement state is created by its owning model.
+            self.state = unsafe { self.function.native.newState() };
+        })
     }
     pub fn predict(&mut self, inputs: &Inputs) -> Result<Prediction, Error> {
-        let input = ProtocolObject::from_retained(inputs.provider()?);
-        // SAFETY: this state was created by this model, remains live, and
-        // exclusive session access prevents overlapping state mutations.
-        let features = unsafe {
-            self.function
-                .native
-                .predictionFromFeatures_usingState_error(&input, &self.state)
-        }
-        .map_err(core_ml)?;
-        Ok(Prediction { features })
+        autoreleasepool(|_| {
+            let input = ProtocolObject::from_retained(inputs.provider()?);
+            // SAFETY: this state was created by this model, remains live, and
+            // exclusive session access prevents overlapping state mutations.
+            let features = unsafe {
+                self.function
+                    .native
+                    .predictionFromFeatures_usingState_error(&input, &self.state)
+            }
+            .map_err(core_ml)?;
+            Ok(Prediction { features })
+        })
     }
 }
 /// Native outputs, retained until their last consumer releases them.
@@ -184,13 +201,15 @@ pub struct Prediction {
 }
 impl Prediction {
     pub fn tensor<T: Element>(&self, name: &str) -> Result<Tensor<T>, Error> {
-        // SAFETY: features is a live provider returned by Core ML.
-        let value = unsafe { self.features.featureValueForName(&NSString::from_str(name)) }
-            .ok_or_else(|| Error::MissingOutput(name.into()))?;
-        // SAFETY: a non-array feature returns None.
-        let array =
-            unsafe { value.multiArrayValue() }.ok_or_else(|| Error::MissingOutput(name.into()))?;
-        Tensor::from_array(array, name)
+        autoreleasepool(|_| {
+            // SAFETY: features is a live provider returned by Core ML.
+            let value = unsafe { self.features.featureValueForName(&NSString::from_str(name)) }
+                .ok_or_else(|| Error::MissingOutput(name.into()))?;
+            // SAFETY: a non-array feature returns None.
+            let array = unsafe { value.multiArrayValue() }
+                .ok_or_else(|| Error::MissingOutput(name.into()))?;
+            Tensor::from_array(array, name)
+        })
     }
 }
 pub(crate) fn configuration(
