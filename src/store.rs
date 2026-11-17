@@ -121,8 +121,12 @@ impl sealed::Install for crate::Archive {
         dest: &Path,
     ) -> Result<(), Failed> {
         let staging = tempfile::Builder::new().prefix(prefix).tempdir_in(root)?;
-        unpack(staged.as_file(), staging.path())?;
-        std::fs::rename(staging.path(), dest)?;
+        let installed = unpack(staged.as_file(), staging.path())
+            .and_then(|()| std::fs::rename(staging.path(), dest).map_err(Failed::from));
+        if let Err(error) = installed {
+            remove_staging(staging.path())?;
+            return Err(error);
+        }
         // The directory now lives at `dest`; dropping the guard would delete
         // whatever later takes the staging name.
         let _ = staging.keep();
@@ -360,12 +364,44 @@ fn sweep(root: &Path, prefix: &str) -> io::Result<()> {
             continue;
         }
         if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
+            remove_staging(&entry.path())?;
         } else {
             std::fs::remove_file(entry.path())?;
         }
     }
     Ok(())
+}
+
+/// Remove only an unpublished staging tree, including restrictive archive
+/// permissions. Never follow links while preparing the owned tree for removal.
+fn remove_staging(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(permissions.mode() | 0o700);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            remove_staging(&entry.path())?;
+        } else {
+            #[cfg(windows)]
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows only: clear the DOS read-only attribute without changing ACLs"
+            )]
+            if kind.is_file() {
+                let mut permissions = entry.metadata()?.permissions();
+                permissions.set_readonly(false);
+                std::fs::set_permissions(entry.path(), permissions)?;
+            }
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    std::fs::remove_dir(path)
 }
 
 /// Unpacks the tar.zst `archive` into `staging`, syncing every extracted
@@ -374,8 +410,13 @@ fn sweep(root: &Path, prefix: &str) -> io::Result<()> {
 /// files and directories is refused.
 #[cfg(feature = "archive")]
 fn unpack(archive: &std::fs::File, staging: &Path) -> Result<(), Failed> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Component;
+
     let decoder = zstd::stream::read::Decoder::new(archive)?;
     let mut tar = tar::Archive::new(decoder);
+    let mut directory_entries = BTreeMap::new();
+    let mut directories = BTreeSet::from([staging.to_path_buf()]);
     for entry in tar.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -386,20 +427,67 @@ fn unpack(archive: &std::fs::File, staging: &Path) -> Result<(), Failed> {
                 reason: "not a regular file or a directory",
             });
         }
-        if !entry.unpack_in(staging)? {
+        // Both separator forms and drive/stream prefixes must be rejected on
+        // every host, so a verified archive has the same boundary everywhere.
+        let raw = entry.path_bytes();
+        if raw.starts_with(b"/")
+            || raw.starts_with(b"\\")
+            || raw.contains(&b':')
+            || raw.split(|&c| c == b'/' || c == b'\\').any(|c| c == b"..")
+            || path
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        {
             return Err(Failed::Archive {
                 entry: path,
                 reason: "escapes the archive root",
             });
         }
-        if kind == tar::EntryType::Regular {
-            std::fs::File::open(staging.join(&path))?.sync_all()?;
+        let destination = staging.join(&path);
+        if kind == tar::EntryType::Directory {
+            std::fs::create_dir_all(&destination)?;
+            directories.insert(destination.clone());
+            // Restrictive directory modes are applied after their children.
+            directory_entries.insert(destination.clone(), entry);
+        } else {
+            std::fs::create_dir_all(destination.parent().ok_or_else(|| Failed::Archive {
+                entry: path.clone(),
+                reason: "file has no parent directory",
+            })?)?;
+            // The staging tree is private and contains only directories and
+            // regular files. Every component was checked above; no archive
+            // entry can introduce a link or an absolute destination.
+            let tar::Unpacked::File(file) = entry.unpack(&destination)? else {
+                return Err(Failed::Archive {
+                    entry: path,
+                    reason: "regular entry produced no file",
+                });
+            };
+            // Retain the original writable handle through flushing. This
+            // also works after tar applies a read-only permission mode.
+            file.sync_all()?;
+        }
+        for ancestor in destination.parent().into_iter().flat_map(Path::ancestors) {
+            if !ancestor.starts_with(staging) {
+                break;
+            }
+            directories.insert(ancestor.to_path_buf());
         }
     }
-    // Windows opens no directory as a `File` and has no directory fsync;
-    // NTFS journals the rename itself.
-    #[cfg(unix)]
-    std::fs::File::open(staging)?.sync_all()?;
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        // Open before applying restrictive directory permissions. Child
+        // directory entries reach disk before their containing directories.
+        #[cfg(unix)]
+        let handle = std::fs::File::open(&directory)?;
+        if let Some(mut entry) = directory_entries.remove(&directory) {
+            entry.unpack(&directory)?;
+        }
+        // Windows has no directory fsync; NTFS journals the final rename.
+        #[cfg(unix)]
+        handle.sync_all()?;
+    }
     Ok(())
 }
 

@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "ondevice"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-fs",
  "async-io",
@@ -1287,9 +1287,11 @@ dependencies = [
 
 [[package]]
 name = "ondevice-coreml"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
+ "async-channel",
  "block2",
+ "futures-lite",
  "half",
  "objc2",
  "objc2-core-foundation",
@@ -1299,7 +1301,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tracing",
 ]
 
 [[package]]

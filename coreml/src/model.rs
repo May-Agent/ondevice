@@ -1,386 +1,291 @@
-//! The compiled multifunction model and its predictions.
-
-use std::cell::RefCell;
-use std::ffi::c_void;
-use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
-
-use block2::StackBlock;
-use objc2::AllocAnyThread;
-use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2_core_ml::{
-    MLArrayBatchProvider, MLBatchProvider, MLComputeUnits, MLDictionaryFeatureProvider,
-    MLFeatureProvider, MLFeatureValue, MLModel, MLModelConfiguration, MLMultiArray,
-    MLMultiArrayDataType,
+//! Compiled artifacts, independently loaded functions, and owned stateful sessions.
+use crate::{ComputeUnits, DataType, Element, Error, Inputs, Tensor};
+use objc2::{
+    AllocAnyThread,
+    rc::{Retained, autoreleasepool},
+    runtime::ProtocolObject,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSInteger, NSNumber, NSString, NSURL};
+use objc2_core_ml::{
+    MLArrayBatchProvider, MLBatchProvider, MLFeatureDescription, MLFeatureProvider, MLModel,
+    MLModelConfiguration, MLState,
+};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSInteger, NSString, NSURL};
+use std::{
+    cell::Cell,
+    collections::BTreeMap,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+};
 
-use crate::{DataType, Element, Error, Input, Manifest, Tensor};
-
-/// The hardware a [`Model`]'s functions run on: Core ML's
-/// `MLComputeUnits`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComputeUnits {
-    /// The CPU alone.
-    CpuOnly,
-    /// The GPU, with the CPU for what the GPU does not run.
-    CpuAndGpu,
-    /// The Neural Engine, with the CPU for what it does not run.
-    CpuAndNeuralEngine,
-    /// Whatever Core ML picks among CPU, GPU and Neural Engine.
-    All,
+/// A tensor feature's native default shape. Flexible constraints are enforced
+/// by Core ML; this shape is descriptive and is not a padding policy.
+#[derive(Debug, Clone)]
+pub struct FeatureDescription {
+    pub data_type: DataType,
+    pub default_shape: Vec<usize>,
+    pub optional: bool,
 }
-
-impl ComputeUnits {
-    fn ml(self) -> MLComputeUnits {
-        match self {
-            Self::CpuOnly => MLComputeUnits::CPUOnly,
-            Self::CpuAndGpu => MLComputeUnits::CPUAndGPU,
-            Self::CpuAndNeuralEngine => MLComputeUnits::CPUAndNeuralEngine,
-            Self::All => MLComputeUnits::All,
-        }
-    }
+/// A loaded function's features, read from the compiled model itself.
+#[derive(Debug, Clone)]
+pub struct FunctionDescription {
+    pub inputs: BTreeMap<String, FeatureDescription>,
+    pub outputs: BTreeMap<String, FeatureDescription>,
+    pub states: BTreeMap<String, FeatureDescription>,
 }
-
-/// One function's `MLModel`.
-struct Bucket {
-    /// The sequence length the function accepts.
-    len: usize,
-    model: Retained<MLModel>,
-}
-
-/// A compiled multifunction Core ML model: one function per sequence-length
-/// bucket, all loaded from the same `.mlmodelc` so they share its weights.
-///
-/// A prediction pads its inputs to the smallest bucket that holds them and
-/// runs that function. Prediction is blocking; the caller owns the thread
-/// and its QoS.
+/// A compiled model artifact. Functions are loaded explicitly and may have
+/// different input/output contracts. No tokenizer or bucketing policy is implied.
+#[derive(Debug, Clone)]
 pub struct Model {
-    manifest: Manifest,
-    /// One per manifest function, in the same (ascending) order.
-    buckets: Box<[Bucket]>,
+    path: PathBuf,
 }
-
-// SAFETY: `MLModel` may be used from any thread provided calls on the same
-// object do not overlap. `Model` is `!Sync` and every method that touches
-// its `MLModel`s takes `&mut self`, so those calls never overlap; moving the
-// model between threads preserves that.
-unsafe impl Send for Model {}
-
 impl Model {
-    /// Loads a model directory — `manifest.json` beside exactly one
-    /// compiled `*.mlmodelc` — with every function on `units`.
-    ///
-    /// # Errors
-    ///
-    /// The [`Manifest::load`] failures, [`Error::ModelDir`] without exactly
-    /// one bundle, [`Error::CoreMl`] when Core ML refuses a function.
-    pub fn open(dir: impl AsRef<Path>, units: ComputeUnits) -> Result<Self, Error> {
-        let dir = dir.as_ref();
-        let manifest = Manifest::load(dir)?;
-        let bundle = compiled_bundle(dir)?;
-        let url = NSURL::fileURLWithPath_isDirectory(
-            &NSString::from_str(&bundle.to_string_lossy()),
-            true,
-        );
-        let buckets = manifest
-            .functions()
-            .iter()
-            .map(|function| {
-                // SAFETY: plain Objective-C allocation and init; there are no
-                // invariants the caller must uphold.
-                let config = unsafe { MLModelConfiguration::new() };
-                // SAFETY: `config` is a live configuration, `units.ml()` a
-                // valid `MLComputeUnits`, and `function.name` names a
-                // function the manifest declares.
-                unsafe {
-                    config.setComputeUnits(units.ml());
-                    config.setFunctionName(Some(&NSString::from_str(&function.name)));
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let path = path.canonicalize().map_err(|source| Error::Io {
+            path: path.into(),
+            source,
+        })?;
+        Ok(Self { path })
+    }
+    /// Load a named function, or the model's default when name is None.
+    /// Loading and prediction execute on the caller's inference thread.
+    pub fn function(&self, name: Option<&str>, units: ComputeUnits) -> Result<Function, Error> {
+        autoreleasepool(|_| {
+            let config = configuration(name, units);
+            let url = NSURL::fileURLWithPath_isDirectory(
+                &NSString::from_str(&self.path.to_string_lossy()),
+                true,
+            );
+            // SAFETY: URL and configuration are live objects with valid values.
+            let native =
+                unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &config) }
+                    .map_err(core_ml)?;
+            // SAFETY: the model owns its feature description dictionaries.
+            let description = unsafe {
+                let d = native.modelDescription();
+                FunctionDescription {
+                    inputs: describe(&d.inputDescriptionsByName(), false)?,
+                    outputs: describe(&d.outputDescriptionsByName(), false)?,
+                    states: describe(&d.stateDescriptionsByName(), true)?,
                 }
-                // SAFETY: `url` is the compiled bundle and `config` a valid
-                // configuration; a load failure is reported through `error`.
-                let model =
-                    unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &config) }
-                        .map_err(core_ml)?;
-                Ok(Bucket {
-                    len: function.len,
-                    model,
-                })
+            };
+            Ok(Function {
+                native,
+                description,
+                not_sync: PhantomData,
             })
-            .collect::<Result<Box<[Bucket]>, Error>>()?;
-        tracing::debug!(
-            bundle = %bundle.display(),
-            functions = buckets.len(),
-            ?units,
-            "Core ML model loaded"
-        );
-        Ok(Self { manifest, buckets })
+        })
     }
-
-    /// The model's manifest.
-    #[must_use]
-    pub fn manifest(&self) -> &Manifest {
-        &self.manifest
-    }
-
-    /// Runs one prediction: `inputs`, all of one length, padded to the
-    /// smallest bucket that holds them.
-    ///
-    /// # Panics
-    ///
-    /// When `inputs` is empty or its inputs differ in length: one
-    /// prediction is one sequence.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::TooLong`] past the largest bucket, [`Error::UnknownInput`]
-    /// for an input the manifest does not declare, and [`Error::CoreMl`].
-    pub fn predict(&mut self, inputs: &[&dyn Input]) -> Result<Prediction, Error> {
-        let bucket = self.bucket_for(sequence_len(inputs))?;
-        let provider = features(&self.manifest, inputs, bucket.len)?;
-        // SAFETY: `provider` is a valid MLFeatureProvider.
-        let features = unsafe {
-            bucket
-                .model
-                .predictionFromFeatures_error(&ProtocolObject::from_retained(provider))
-        }
-        .map_err(core_ml)?;
-        Ok(Prediction { features })
-    }
-
-    /// Runs one Core ML batch prediction: each item a [`predict`]-style
-    /// input set, all padded to the smallest bucket that holds the longest.
-    ///
-    /// [`predict`]: Self::predict
-    ///
-    /// # Panics
-    ///
-    /// When an item is empty or its inputs differ in length, and when Core
-    /// ML breaks its contract by returning another number of predictions
-    /// than items.
-    ///
-    /// # Errors
-    ///
-    /// As [`predict`](Self::predict).
-    pub fn predict_batch(&mut self, batch: &[&[&dyn Input]]) -> Result<Vec<Prediction>, Error> {
-        let Some(longest) = batch.iter().map(|inputs| sequence_len(inputs)).max() else {
-            return Ok(Vec::new());
-        };
-        let bucket = self.bucket_for(longest)?;
-        let providers = batch
-            .iter()
-            .map(|inputs| {
-                features(&self.manifest, inputs, bucket.len).map(ProtocolObject::from_retained)
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let providers = NSArray::from_retained_slice(&providers);
-        // SAFETY: `providers` holds valid MLFeatureProviders.
-        let provider = unsafe {
-            MLArrayBatchProvider::initWithFeatureProviderArray(
-                MLArrayBatchProvider::alloc(),
-                &providers,
-            )
-        };
-        // SAFETY: `provider` is a valid MLBatchProvider.
-        let out = unsafe {
-            bucket
-                .model
-                .predictionsFromBatch_error(&ProtocolObject::from_retained(provider))
-        }
-        .map_err(core_ml)?;
-        // SAFETY: `out` is a batch provider the model returned.
-        let count = unsafe { out.count() } as usize;
-        assert_eq!(
-            count,
-            batch.len(),
-            "Core ML's predictionsFromBatch returned {count} predictions for {} items",
-            batch.len()
-        );
-        Ok((0..count)
-            .map(|i| Prediction {
-                // SAFETY: `i` is below `out.count()`.
-                features: unsafe { out.featuresAtIndex(i as NSInteger) },
-            })
-            .collect())
-    }
-
-    /// The smallest bucket that holds `len`.
-    fn bucket_for(&self, len: usize) -> Result<&Bucket, Error> {
-        self.buckets
-            .iter()
-            .find(|bucket| len <= bucket.len)
-            .ok_or(Error::TooLong {
-                len,
-                max: self.manifest.max_len(),
-            })
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
-
-/// The outputs of one prediction.
+/// One loaded Core ML function. It may be moved to an inference worker, but
+/// calls on the same function cannot overlap.
+pub struct Function {
+    native: Retained<MLModel>,
+    description: FunctionDescription,
+    not_sync: PhantomData<Cell<()>>,
+}
+// SAFETY: MLModel permits use from any thread. Function is !Sync and all
+// prediction calls require exclusive ownership, so calls never overlap.
+unsafe impl Send for Function {}
+impl Function {
+    pub fn description(&self) -> &FunctionDescription {
+        &self.description
+    }
+    pub fn predict(&mut self, inputs: &Inputs) -> Result<Prediction, Error> {
+        autoreleasepool(|_| {
+            if !self.description.states.is_empty() {
+                return Err(Error::StateRequired);
+            }
+            let input = ProtocolObject::from_retained(inputs.provider()?);
+            // SAFETY: valid feature provider; &mut self serializes model use.
+            let features =
+                unsafe { self.native.predictionFromFeatures_error(&input) }.map_err(core_ml)?;
+            Ok(Prediction { features })
+        })
+    }
+    pub fn predict_batch(&mut self, batch: &[Inputs]) -> Result<Vec<Prediction>, Error> {
+        autoreleasepool(|_| {
+            if !self.description.states.is_empty() {
+                return Err(Error::StateRequired);
+            }
+            if batch.is_empty() {
+                return Ok(Vec::new());
+            }
+            let providers = batch
+                .iter()
+                .map(|x| x.provider().map(ProtocolObject::from_retained))
+                .collect::<Result<Vec<_>, _>>()?;
+            let array = NSArray::from_retained_slice(&providers);
+            // SAFETY: every array entry is a live feature provider.
+            let provider = unsafe {
+                MLArrayBatchProvider::initWithFeatureProviderArray(
+                    MLArrayBatchProvider::alloc(),
+                    &array,
+                )
+            };
+            // SAFETY: exclusive model access and a valid batch provider.
+            let out = unsafe {
+                self.native
+                    .predictionsFromBatch_error(&ProtocolObject::from_retained(provider))
+            }
+            .map_err(core_ml)?;
+            // SAFETY: out is a retained Core ML batch provider.
+            let count = unsafe { out.count() } as usize;
+            if count != batch.len() {
+                return Err(Error::BatchCount {
+                    expected: batch.len(),
+                    actual: count,
+                });
+            }
+            Ok((0..count)
+                .map(|i| Prediction {
+                    // SAFETY: i is within the returned batch count.
+                    features: unsafe { out.featuresAtIndex(i as NSInteger) },
+                })
+                .collect())
+        })
+    }
+    /// Transfer this function to a session that exclusively owns its state.
+    /// Load another function from the artifact for an independent request.
+    pub fn into_session(self) -> Session {
+        autoreleasepool(|_| {
+            // SAFETY: newState creates zeroed state belonging to this exact model.
+            let state = unsafe { self.native.newState() };
+            Session {
+                function: self,
+                state,
+            }
+        })
+    }
+}
+/// A function and its state, moved and reset together. State from another
+/// model cannot be passed to a prediction through this API.
+pub struct Session {
+    function: Function,
+    state: Retained<MLState>,
+}
+// SAFETY: Session owns both objects and requires &mut self for prediction
+// and reset; no aliases to its mutable state are exposed.
+unsafe impl Send for Session {}
+impl Session {
+    pub fn description(&self) -> &FunctionDescription {
+        self.function.description()
+    }
+    pub fn reset(&mut self) {
+        autoreleasepool(|_| {
+            // SAFETY: replacement state is created by its owning model.
+            self.state = unsafe { self.function.native.newState() };
+        })
+    }
+    pub fn predict(&mut self, inputs: &Inputs) -> Result<Prediction, Error> {
+        autoreleasepool(|_| {
+            let input = ProtocolObject::from_retained(inputs.provider()?);
+            // SAFETY: this state was created by this model, remains live, and
+            // exclusive session access prevents overlapping state mutations.
+            let features = unsafe {
+                self.function
+                    .native
+                    .predictionFromFeatures_usingState_error(&input, &self.state)
+            }
+            .map_err(core_ml)?;
+            Ok(Prediction { features })
+        })
+    }
+}
+/// Native outputs, retained until their last consumer releases them.
 pub struct Prediction {
     features: Retained<ProtocolObject<dyn MLFeatureProvider>>,
 }
-
 impl Prediction {
-    /// The output `name`, copied out as a [`Tensor`] of `T`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::MissingOutput`] when the prediction has no multi-array
-    /// `name`, [`Error::OutputType`] when its elements are not `T`.
-    pub fn output<T: Element>(&self, name: &str) -> Result<Tensor<T>, Error> {
-        let missing = || Error::MissingOutput(name.to_owned());
-        // SAFETY: `features` is a feature provider the model returned.
-        let value = unsafe { self.features.featureValueForName(&NSString::from_str(name)) }
-            .ok_or_else(missing)?;
-        // SAFETY: `value` is a live feature value; `multiArrayValue` returns
-        // nil when the feature is not a multi-array.
-        let array = unsafe { value.multiArrayValue() }.ok_or_else(missing)?;
-        // SAFETY: `array` is a live multi-array.
-        let actual = unsafe { array.dataType() };
-        if actual != ml_data_type(T::DATA_TYPE) {
-            return Err(Error::OutputType {
-                name: name.to_owned(),
-                expected: T::DATA_TYPE,
-                actual,
-            });
-        }
-        // SAFETY: `array` is a live multi-array.
-        let shape: Vec<usize> = unsafe { array.shape() }
-            .iter()
-            .map(|n| n.as_usize())
-            .collect();
-        // SAFETY: `array` is a live multi-array.
-        let strides: Vec<isize> = unsafe { array.strides() }
-            .iter()
-            .map(|n| n.as_isize())
-            .collect();
-        let bytes = RefCell::new(Vec::new());
-        let copy = StackBlock::new(|ptr: NonNull<c_void>, size: NSInteger| {
-            // SAFETY: `ptr` is the array's storage, `size` bytes, valid for
-            // the block's duration; the copy reads exactly those bytes and
-            // keeps no pointer past the block.
-            let storage =
-                unsafe { std::slice::from_raw_parts(ptr.as_ptr().cast::<u8>(), size as usize) };
-            bytes.borrow_mut().extend_from_slice(storage);
-        });
-        // SAFETY: `copy` reads only within `ptr..ptr + size` while it runs.
-        unsafe { array.getBytesWithHandler(&copy) };
-        Ok(Tensor::gather(&bytes.into_inner(), &shape, &strides))
+    pub fn tensor<T: Element>(&self, name: &str) -> Result<Tensor<T>, Error> {
+        autoreleasepool(|_| {
+            // SAFETY: features is a live provider returned by Core ML.
+            let value = unsafe { self.features.featureValueForName(&NSString::from_str(name)) }
+                .ok_or_else(|| Error::MissingOutput(name.into()))?;
+            // SAFETY: a non-array feature returns None.
+            let array = unsafe { value.multiArrayValue() }
+                .ok_or_else(|| Error::MissingOutput(name.into()))?;
+            Tensor::from_array(array, name)
+        })
     }
 }
-
-/// The sequence length `inputs` share.
-fn sequence_len(inputs: &[&dyn Input]) -> usize {
-    let len = inputs.first().expect("a prediction has inputs").len();
-    assert!(
-        inputs.iter().all(|input| input.len() == len),
-        "the inputs of one prediction differ in length"
-    );
-    len
+pub(crate) fn configuration(
+    name: Option<&str>,
+    units: ComputeUnits,
+) -> Retained<MLModelConfiguration> {
+    // SAFETY: native allocation and setters with valid argument values.
+    unsafe {
+        let config = MLModelConfiguration::new();
+        config.setComputeUnits(units.ml());
+        config.setFunctionName(name.map(NSString::from_str).as_deref());
+        config
+    }
 }
-
-/// The feature provider for `inputs` padded to `len`.
-fn features(
-    manifest: &Manifest,
-    inputs: &[&dyn Input],
-    len: usize,
-) -> Result<Retained<MLDictionaryFeatureProvider>, Error> {
-    let mut names = Vec::with_capacity(inputs.len());
-    let mut values = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let spec = manifest
-            .inputs()
-            .get(input.name())
-            .ok_or_else(|| Error::UnknownInput(input.name().to_owned()))?;
-        let rank = spec.shape.len();
-        let shape: Vec<Retained<NSNumber>> = (0..rank)
-            .map(|axis| NSNumber::new_usize(if axis + 1 == rank { len } else { 1 }))
-            .collect();
-        let shape = NSArray::from_retained_slice(&shape);
-        // SAFETY: `alloc` and `initWithShape:dataType:` are sound here; the
-        // returned array owns its elements and stays alive through the
-        // feature provider, so Core ML's deferred release frees memory it
-        // owns.
-        let array = unsafe {
-            MLMultiArray::initWithShape_dataType_error(
-                MLMultiArray::alloc(),
-                &shape,
-                ml_data_type(input.data_type()),
-            )
-        }
-        .map_err(core_ml)?;
-        // ObjC handler blocks must not panic: the block only reads the last
-        // stride and hands it to `fill`, which writes in bounds.
-        let fill = StackBlock::new(
-            |ptr: NonNull<c_void>, _size: NSInteger, strides: NonNull<NSArray<NSNumber>>| {
-                // SAFETY: `strides` is a live `NSArray` holding one entry per
-                // dimension, `rank` of them, so index `rank - 1` is in bounds.
-                let stride = unsafe { strides.as_ref() }
-                    .objectAtIndex(rank - 1)
-                    .as_usize();
-                // SAFETY: `ptr` is the storage of a `[1, …, 1, len]` array of
-                // `input.data_type()`, so it holds `len` elements `stride`
-                // apart along the last axis, writable for the block's
-                // duration; `len >= input.len()` since the bucket holds it.
-                unsafe { input.fill(ptr, stride, len) };
+fn describe(
+    dictionary: &NSDictionary<NSString, MLFeatureDescription>,
+    state: bool,
+) -> Result<BTreeMap<String, FeatureDescription>, Error> {
+    let mut features = BTreeMap::new();
+    let (names, descriptions) = dictionary.to_vecs();
+    for (name, feature) in names.into_iter().zip(descriptions) {
+        // SAFETY: descriptions and constraints belong to the loaded model.
+        let (dtype, shape, optional) = unsafe {
+            if state {
+                let c = feature
+                    .stateConstraint()
+                    .ok_or_else(|| Error::UnsupportedFeature(name.to_string()))?;
+                (c.dataType(), c.bufferShape(), false)
+            } else {
+                let c = feature
+                    .multiArrayConstraint()
+                    .ok_or_else(|| Error::UnsupportedFeature(name.to_string()))?;
+                (c.dataType(), c.shape(), feature.isOptional())
+            }
+        };
+        use objc2_core_ml::MLMultiArrayDataType as D;
+        let data_type = match dtype {
+            D::Int32 => DataType::Int32,
+            D::Float16 => DataType::Float16,
+            D::Float32 => DataType::Float32,
+            _ => return Err(Error::UnsupportedFeature(name.to_string())),
+        };
+        features.insert(
+            name.to_string(),
+            FeatureDescription {
+                data_type,
+                default_shape: shape.iter().map(|d| d.as_usize()).collect(),
+                optional,
             },
         );
-        // SAFETY: `fill` writes only within the elements `ptr` and `strides`
-        // describe, and keeps no pointer past the block.
-        unsafe { array.getMutableBytesWithHandler(&fill) };
-        names.push(NSString::from_str(input.name()));
-        // SAFETY: `array` is a live multi-array.
-        values.push(unsafe { MLFeatureValue::featureValueWithMultiArray(&array) });
     }
-    let names: Vec<&NSString> = names.iter().map(|name| &**name).collect();
-    let values: Vec<&AnyObject> = values.iter().map(|value| value.as_ref()).collect();
-    let features: Retained<NSDictionary<NSString, AnyObject>> =
-        NSDictionary::from_slices(&names, &values);
-    // SAFETY: `features` pairs NSString keys with feature values.
-    unsafe {
-        MLDictionaryFeatureProvider::initWithDictionary_error(
-            MLDictionaryFeatureProvider::alloc(),
-            &features,
-        )
-    }
-    .map_err(core_ml)
+    Ok(features)
 }
-
-fn ml_data_type(data_type: DataType) -> MLMultiArrayDataType {
-    match data_type {
-        DataType::Int32 => MLMultiArrayDataType::Int32,
-        DataType::Float16 => MLMultiArrayDataType::Float16,
-        DataType::Float32 => MLMultiArrayDataType::Float32,
-    }
-}
-
-/// The one `*.mlmodelc` bundle in `dir`, canonicalized.
-fn compiled_bundle(dir: &Path) -> Result<PathBuf, Error> {
-    let io = |source| Error::Io {
-        path: dir.to_path_buf(),
+pub(crate) fn compiled_bundle(dir: &Path) -> Result<PathBuf, Error> {
+    let entries = std::fs::read_dir(dir).map_err(|source| Error::Io {
+        path: dir.into(),
         source,
-    };
-    let mut bundles = std::fs::read_dir(dir)
-        .map_err(io)?
-        .map(|entry| entry.map(|entry| entry.path()).map_err(io))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|path| path.extension().is_some_and(|e| e == "mlmodelc"));
-    let bundle = bundles
-        .next()
-        .ok_or_else(|| Error::ModelDir(dir.to_path_buf()))?;
-    if bundles.next().is_some() {
-        return Err(Error::ModelDir(dir.to_path_buf()));
+    })?;
+    let mut bundles = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|source| Error::Io {
+                path: dir.into(),
+                source,
+            })?
+            .path();
+        if path.extension().is_some_and(|e| e == "mlmodelc") {
+            bundles.push(path);
+        }
     }
-    bundle.canonicalize().map_err(|source| Error::Io {
-        path: bundle,
-        source,
-    })
+    if bundles.len() != 1 {
+        return Err(Error::ModelDir(dir.into()));
+    }
+    Ok(bundles.remove(0))
 }
-
-fn core_ml(error: Retained<NSError>) -> Error {
+pub(crate) fn core_ml(error: Retained<NSError>) -> Error {
     Error::CoreMl {
         domain: error.domain().to_string(),
         code: error.code(),

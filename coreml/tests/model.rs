@@ -8,7 +8,8 @@
 use std::path::PathBuf;
 
 use ondevice_coreml::{
-    ComputeUnits, DataType, Dim, Error, Input, Manifest, Model, Prediction, Sequence, f16,
+    BucketModel as Model, ComputeUnits, DataType, Dim, Error, Input, Manifest, Prediction,
+    Sequence, f16,
 };
 
 fn model_dir() -> PathBuf {
@@ -90,20 +91,22 @@ fn outputs(manifest: &Manifest, prediction: &Prediction) -> Vec<f32> {
         .iter()
         .flat_map(|(name, spec)| match spec.data_type {
             DataType::Int32 => prediction
-                .output::<i32>(name)
+                .tensor::<i32>(name)
                 .unwrap()
+                .read()
                 .into_data()
                 .into_iter()
                 .map(|v| v as f32)
                 .collect::<Vec<_>>(),
             DataType::Float16 => prediction
-                .output::<f16>(name)
+                .tensor::<f16>(name)
                 .unwrap()
+                .read()
                 .into_data()
                 .into_iter()
                 .map(f32::from)
                 .collect(),
-            DataType::Float32 => prediction.output::<f32>(name).unwrap().into_data(),
+            DataType::Float32 => prediction.tensor::<f32>(name).unwrap().read().into_data(),
         })
         .collect()
 }
@@ -135,9 +138,24 @@ fn every_bucket_runs_and_returns_the_declared_outputs() {
                     })
                     .collect();
                 let count = match spec.data_type {
-                    DataType::Int32 => prediction.output::<i32>(name).unwrap().data().len(),
-                    DataType::Float16 => prediction.output::<f16>(name).unwrap().data().len(),
-                    DataType::Float32 => prediction.output::<f32>(name).unwrap().data().len(),
+                    DataType::Int32 => prediction
+                        .tensor::<i32>(name)
+                        .unwrap()
+                        .shape()
+                        .iter()
+                        .product::<usize>(),
+                    DataType::Float16 => prediction
+                        .tensor::<f16>(name)
+                        .unwrap()
+                        .shape()
+                        .iter()
+                        .product::<usize>(),
+                    DataType::Float32 => prediction
+                        .tensor::<f32>(name)
+                        .unwrap()
+                        .shape()
+                        .iter()
+                        .product::<usize>(),
                 };
                 if let Some(fixed) = fixed {
                     assert_eq!(count, fixed.iter().product::<usize>(), "{name} at {len}");
@@ -182,15 +200,15 @@ fn undeclared_inputs_and_mistyped_outputs_are_errors() {
     let prediction = predict(&mut model, 3, 0);
     let (name, spec) = model.manifest().outputs().iter().next().unwrap();
     let mistyped = match spec.data_type {
-        DataType::Int32 => prediction.output::<f32>(name).map(drop),
-        DataType::Float16 | DataType::Float32 => prediction.output::<i32>(name).map(drop),
+        DataType::Int32 => prediction.tensor::<f32>(name).map(drop),
+        DataType::Float16 | DataType::Float32 => prediction.tensor::<i32>(name).map(drop),
     };
     assert!(
         matches!(mistyped, Err(Error::OutputType { .. })),
         "{mistyped:?}"
     );
     assert!(matches!(
-        prediction.output::<f32>("no such output"),
+        prediction.tensor::<f32>("no such output"),
         Err(Error::MissingOutput(_))
     ));
 }
