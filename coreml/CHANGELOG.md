@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/May-Agent/ondevice/compare/coreml/v0.0.1...coreml/v0.0.2) - 2026-11-17
+
+### Added
+
+- *(coreml)* [**breaking**] separate model functions, native tensors and stateful sessions
+
+### Fixed
+
+- *(coreml)* drain native temporaries at operation boundaries
+
+### Other
+
+- release v0.0.1
+
 ## [0.0.1](https://github.com/May-Agent/ondevice/releases/tag/coreml/v0.0.1) - 2026-11-06
 
 ### Added

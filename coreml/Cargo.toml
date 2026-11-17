@@ -1,6 +1,6 @@
 [package]
 name = "ondevice-coreml"
-version = "0.0.1"
+version = "0.0.2"
 description = "Typed Core ML functions, tensors, sessions and sequence bucketing"
 edition.workspace = true
 rust-version.workspace = true
