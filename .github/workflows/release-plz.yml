@@ -5,6 +5,8 @@ on:
     branches:
       - dev
       - main
+  # Re-runs release-plz on a branch whose push event GitHub never delivered.
+  workflow_dispatch:
 
 permissions:
   contents: read
