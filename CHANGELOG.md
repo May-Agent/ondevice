@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/May-Agent/ondevice/compare/v0.0.2...v0.0.3) - 2026-11-17
+
+### Other
+
+- Merge pull request #19 from May-Agent/ci/dispatch-publish
+- dispatch publish for each tag release-plz creates
+- approve the release PR's held runs instead of dispatching uncounted ones
+
 ## [0.0.2](https://github.com/May-Agent/ondevice/compare/v0.0.1...v0.0.2) - 2026-11-17
 
 ### Added
