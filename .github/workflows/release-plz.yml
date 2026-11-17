@@ -63,6 +63,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,8 +75,21 @@ jobs:
         with:
           toolchain: stable
       - name: Run release-plz release
+        id: release-plz
         uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A tag pushed with GITHUB_TOKEN starts no workflow, so each tag this
+      # run created dispatches its publish.
+      - name: Publish the released crates
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          set -euo pipefail
+          for tag in $(jq -r '.[].tag' <<<"$RELEASES"); do
+            gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref "$tag"
+          done
